@@ -58,6 +58,14 @@ def init_db(path: Path | None = None) -> None:
                 created_at    TEXT NOT NULL
             );
 
+            -- 跨 DAG 并发组：同名组的限流上限全局唯一、首次提交时持久化。
+            -- 之后任何 DAG 提交同名组必须声明相同上限，否则整批回滚（409）。
+            CREATE TABLE IF NOT EXISTS concurrency_groups (
+                name          TEXT PRIMARY KEY,
+                limit_value   INTEGER NOT NULL CHECK (limit_value > 0),
+                created_at    TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS tasks (
                 id                  TEXT PRIMARY KEY,
                 dag_id              TEXT NOT NULL REFERENCES dags(id),
@@ -80,6 +88,9 @@ def init_db(path: Path | None = None) -> None:
                 created_at          TEXT NOT NULL,
                 started_at          TEXT,
                 finished_at         TEXT,
+                -- 跨 DAG 并发组：NULL 表示不限流；非空时全库同名组内未过期
+                -- running 租约数不得超过 concurrency_groups 中持久化的上限。
+                concurrency_group   TEXT REFERENCES concurrency_groups(name),
                 UNIQUE(dag_id, task_key)
             );
 
@@ -164,6 +175,17 @@ def init_db(path: Path | None = None) -> None:
             conn.execute(
                 "ALTER TABLE tasks ADD COLUMN duration_seconds REAL NOT NULL DEFAULT 1.0"
             )
+        # 旧库迁移：为已有任务补齐并发组列。历史任务均未声明组，默认 NULL —
+        # 行为与新增的无组任务一致，不受跨 DAG 限流影响。
+        if "concurrency_group" not in columns:
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN concurrency_group TEXT REFERENCES concurrency_groups(name)"
+            )
+        conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_tasks_group_occupancy
+                   ON tasks(concurrency_group)
+                   WHERE state = 'running' AND lease_token IS NOT NULL"""
+        )
 
 
 @contextmanager

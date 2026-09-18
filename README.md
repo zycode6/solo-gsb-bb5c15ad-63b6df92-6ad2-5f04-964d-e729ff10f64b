@@ -9,6 +9,15 @@ DAG，工作器原子领取「所有前置均已成功」的任务，凭借唯�
   （`422 cycle_detected`，返回环上的节点序列），重复任务键同样被拒。
 - **依赖门控的原子领取**：只有全部前置任务为 `succeeded` 的任务可被领取；
   领取在单事务 `BEGIN IMMEDIATE` 下完成，并发工作器中只有一个能拿到同一任务。
+- **跨 DAG 并发组限流**：任务可选声明 `concurrency_group`（组名）与
+  `concurrency_limit`（正整数上限），二者必须**同时**提供，只给其一会被 422 拒绝。
+  同名组**跨所有 DAG 全局共享**一个容量：领取时按全库「未过期的 running 租约」
+  计数，租约成功、失败（含回队与最终失败）或过期后名额自动释放；心跳续租会
+  继续占用名额。组上限在首次提交时**持久化**，之后任何提交声明同名组都必须使用
+  **相同**上限，否则整批提交回滚（`409 concurrency_group_conflict`，
+  不留 DAG/任务/事件痕迹）；同一批内自相矛盾（同名组不同上限）返回 422。
+  一次批量领取中新任务立即占位，已满的组会被**跳过并继续**寻找其他可领取任务
+  （其他组或无组任务），尽量填满 `limit`。未声明组的任务行为完全不变。
 - **递增 attempt 与唯一租约令牌**：每次领取生成新的 `attempt`（从 1 起递增）
   和新的随机 `lease_token`，并写入 attempts 历史。
 - **租约过期与旧令牌失效**：租约到期后任务可被再次领取（新尝试、新令牌）；
@@ -96,6 +105,16 @@ curl -i -X POST http://localhost:8000/dags -H 'Content-Type: application/json' \
 curl -i -X POST http://localhost:8000/dags -H 'Content-Type: application/json' \
   -d '{"tasks":[{"key":"a","deps":["c"]},{"key":"b","deps":["a"]},{"key":"c","deps":["b"]}]}'
 # -> 422 {"error":{"code":"cycle_detected","details":{"cycle":["a","c","b","a"]}}}
+
+# 并发组字段只给了一个（必须同时提供）
+curl -i -X POST http://localhost:8000/dags -H 'Content-Type: application/json' \
+  -d '{"tasks":[{"key":"a","concurrency_group":"db-writers"}]}'
+# -> 422
+
+# concurrency_limit 必须是正整数
+curl -i -X POST http://localhost:8000/dags -H 'Content-Type: application/json' \
+  -d '{"tasks":[{"key":"a","concurrency_group":"g","concurrency_limit":0}]}'
+# -> 422
 ```
 
 ### 2. 工作器领取任务
@@ -115,12 +134,75 @@ curl -s -X POST http://localhost:8000/tasks/claim \
       "task_id": "…", "dag_id": "…", "task_key": "extract",
       "attempt": 1,
       "lease_token": "f1a3…", "lease_expires_at": "2026-09-17T11:00:00Z",
-      "lease_seconds": 60.0, "payload": null
+      "lease_seconds": 60.0, "payload": null,
+      "concurrency_group": null
     }
   ],
   "count": 1
 }
 ```
+
+#### 跨 DAG 并发组（concurrency_group / concurrency_limit）
+
+需要限制「同一类任务」在**所有 DAG 之间**的全局并发数时（例如最多 2 个任务同时写
+同一个外部数据库），给任务声明同名组和正整数上限——两个字段必须同时出现：
+
+```bash
+# DAG A：两个写库任务，加入 db-writers 组，上限 2
+curl -s -X POST http://localhost:8000/dags -H 'Content-Type: application/json' -d '{
+  "id": "dag-a",
+  "tasks": [
+    {"key": "write-a1", "concurrency_group": "db-writers", "concurrency_limit": 2},
+    {"key": "write-a2", "concurrency_group": "db-writers", "concurrency_limit": 2}
+  ]
+}'
+
+# DAG B（可在任意时间、由任意调用方提交）：同名组必须声明相同上限 2
+curl -s -X POST http://localhost:8000/dags -H 'Content-Type: application/json' -d '{
+  "id": "dag-b",
+  "tasks": [
+    {"key": "write-b1", "concurrency_group": "db-writers", "concurrency_limit": 2},
+    {"key": "cleanup"}
+  ]
+}'
+```
+
+- 上限 **2** 全局生效：跨 `dag-a`/`dag-b`，组内未过期的 running 租约最多只有 2 个。
+  已占满时，领取会**跳过**组内任务、继续领取 `cleanup` 等其他可领取任务，尽量填满
+  `limit`，而不是整批返回空：
+
+```bash
+# write-a1、write-a2 占位成功（同批立即计入占用）
+curl -s -X POST http://localhost:8000/tasks/claim -H 'Content-Type: application/json' \
+  -d '{"dag_id": "dag-a", "limit": 10}' | jq '.claimed[].task_key'
+# "write-a1"
+# "write-a2"
+
+# 组已满：write-b1 被跳过，cleanup 照常领取
+curl -s -X POST http://localhost:8000/tasks/claim -H 'Content-Type: application/json' \
+  -d '{"dag_id": "dag-b", "limit": 10}' | jq '.claimed[].task_key'
+# "cleanup"
+```
+
+- 名额在租约**成功回报、显式失败（回队或最终 failed）或租约过期**后自动释放；
+  心跳续租期间名额继续占用。无组任务不参与任何限流。
+- 同名组的上限**持久化且必须一致**：之后再提交 `db-writers` 但写成
+  `concurrency_limit: 3` 会整体回滚（`409 concurrency_group_conflict`），
+  该次提交的全部任务与事件都不会落库：
+
+```bash
+curl -i -X POST http://localhost:8000/dags -H 'Content-Type: application/json' -d '{
+  "id": "dag-c",
+  "tasks": [{"key": "write-c1", "concurrency_group": "db-writers", "concurrency_limit": 3}]
+}'
+# HTTP/1.1 409
+# {"error":{"code":"concurrency_group_conflict",
+#   "details":{"group":"db-writers","existing_limit":2,"submitted_limit":3}}}
+```
+
+任务查询（`GET /tasks/{id}`、`GET /tasks`、`GET /dags/{id}`）在任务对象上返回
+`concurrency` 字段：有组时为 `{"group": "db-writers", "limit": 2}`，无组时为 `null`；
+领取响应中的每个任务也带 `concurrency_group`（无组为 `null`）。
 
 ### 3. 续租（心跳）
 
@@ -185,6 +267,7 @@ curl -s 'http://localhost:8000/tasks?state=blocked'
 {
   "key": "transform", "state": "failed", "attempt": 3, "max_retries": 2,
   "lease": null, "blocked_reason": null,
+  "concurrency": null,
   "attempts": [
     {"attempt": 1, "state": "failed",    "error": "connection reset", "lease_token": "…", "expires_at": "…", "heartbeat_at": null, "expired": false},
     {"attempt": 2, "state": "expired",   "error": null,               "lease_token": "…", "expires_at": "…", "heartbeat_at": null, "expired": true},
@@ -194,7 +277,10 @@ curl -s 'http://localhost:8000/tasks?state=blocked'
 ```
 
 被阻塞后继示例：`{"key": "load", "state": "blocked", "blocked_reason":
-"upstream 'transform' permanently failed", "lease": null}`。
+"upstream 'transform' permanently failed", "lease": null, "concurrency": null}`。
+
+并发组任务示例：`{"key": "write-a1", "state": "running",
+"concurrency": {"group": "db-writers", "limit": 2}, "lease": {"expired": false, …}}`。
 
 ### 6. 事件流
 
@@ -306,7 +392,7 @@ curl -s http://localhost:8000/dags/<DAG_ID>/analysis | jq
 | `POST` | `/dags` | 提交 DAG（校验缺失依赖与环） |
 | `GET` | `/dags/{dag_id}` | DAG 概览：状态计数与任务列表 |
 | `GET` | `/dags/{dag_id}/analysis` | 只读分析：最早/最晚时间、总工期、关键路径与并行层级 |
-| `POST` | `/tasks/claim` | 原子领取前置全部成功的任务 |
+| `POST` | `/tasks/claim` | 原子领取前置全部成功的任务（跳过已满的跨 DAG 并发组，尽量填满 limit） |
 | `GET` | `/tasks?dag_id=&state=` | 任务列表（可过滤） |
 | `GET` | `/events?after=&limit=&dag_id=` | 不可变事件流：按 sequence 升序键集分页 |
 | `GET` | `/tasks/{task_id}` | 任务详情：尝试历史、租约、阻塞原因 |
@@ -332,6 +418,9 @@ pytest -q
 ```
 
 测试覆盖：DAG 校验（缺失依赖/环/重复键）、依赖门控、并发原子领取、
+跨 DAG 并发组（字段必须成对且为正整数、组容量占用与同批即时占位、满组跳过继续填满
+limit、跨 DAG 共享容量、同名组上限持久化一致与冲突整批回滚、成功/失败/过期释放名额、
+心跳续租保持占用、重启后上限与限流仍生效、无组任务不受影响、旧库迁移补 NULL）、
 attempt 递增与令牌唯一、过期后旧令牌 409、心跳续租、重试与耗尽后递归阻塞、
 幂等回报（重放同响应、内容冲突 409、键序等价、重启后持久化）、旧 SQLite 数据迁移、
 状态接口、持久化事件流（各事件类型与状态对、同事务回滚不留事件、重放不产生事件、
