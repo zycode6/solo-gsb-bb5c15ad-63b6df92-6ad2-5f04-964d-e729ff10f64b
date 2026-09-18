@@ -26,6 +26,16 @@ DAG，工作器原子领取「所有前置均已成功」的任务，凭借唯�
   JSON 对象键序不同不影响等价判定。幂等记录持久化在 SQLite 中，服务重启后仍有效。
 - **剩余额度**：状态响应中的 `retries_remaining = max(0, max_retries - failure_count)`，
   与显式失败计数一致，不因租约过期重领而减少。
+- **跨 DAG 并发组限流**：任务可声明 `concurrency_group` 与 `concurrency_limit`
+  （两者必须同时提供，上限为正整数，否则 `422`）。同名组的全局上限在首次提交时
+  持久化到 `concurrency_groups` 注册表，之后所有引用该组的提交必须声明相同上限：
+  同一提交内不一致返回 `422 concurrency_limit_conflict`，与已持久化上限冲突返回
+  `409 concurrency_limit_conflict`，且整个 DAG 提交（含事件）整体回滚。
+  领取时在 `BEGIN IMMEDIATE` 事务内按**全局未过期 running 租约**统计每个组的占用
+  （同名组跨 DAG 共享额度）：组已满的任务被跳过并继续寻找其他可领取任务，
+  尽量填满本次 `limit`；同一批次内新领取的任务立即占位。租约完成、失败
+  （含重试回队与最终失败）或过期后名额自动释放。未声明组的任务不受任何限制，
+  行为与之前完全一致。
 - **持久化事件流**：所有关键状态变迁都在**同一事务**内向只增（append-only）的事件流
   追加一条不可变事件——`dag.created`（DAG 创建）以及
   `task.claimed`（领取/过期重领）、`task.requeued`（失败重排）、
@@ -122,7 +132,50 @@ curl -s -X POST http://localhost:8000/tasks/claim \
 }
 ```
 
-### 3. 续租（心跳）
+### 3. 跨 DAG 并发组限流（可选）
+
+任务可声明 `concurrency_group` 与 `concurrency_limit`（两者必须同时提供，
+上限为正整数），同名组的运行名额**跨 DAG 全局共享**。例如限制「同时最多
+2 个任务访问 GPU」，无论任务来自哪个 DAG：
+
+```bash
+# DAG 1：两个训练任务声明 gpu 组，上限 2
+curl -s -X POST http://localhost:8000/dags \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "train-a", "tasks": [
+        {"key": "fit-1", "concurrency_group": "gpu", "concurrency_limit": 2},
+        {"key": "fit-2", "concurrency_group": "gpu", "concurrency_limit": 2}
+      ]}'
+
+# DAG 2：另一个工作流引用同名组，上限必须一致
+curl -s -X POST http://localhost:8000/dags \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "train-b", "tasks": [
+        {"key": "fit-3", "concurrency_group": "gpu", "concurrency_limit": 2}
+      ]}'
+```
+
+此时任意时刻 `fit-1`/`fit-2`/`fit-3` 中最多 2 个处于运行中：一次
+`POST /tasks/claim`（`limit` 足够大时）会领到其中 2 个，第 3 个因组已满被跳过；
+同批领取立即占位，其余无组任务照常领取、尽量填满 `limit`。任一运行中的任务
+完成、失败或租约过期后名额自动释放，被跳过的任务即可被后续领取。
+
+同名组的上限必须全局一致，冲突的提交会整体回滚：
+
+```bash
+# 与已持久化的 gpu=2 冲突：整个 DAG 提交回滚，不留任何任务或事件
+curl -i -X POST http://localhost:8000/dags -H 'Content-Type: application/json' \
+  -d '{"tasks": [{"key": "x", "concurrency_group": "gpu", "concurrency_limit": 4}]}'
+# -> 409 {"error":{"code":"concurrency_limit_conflict",
+#         "details":{"group":"gpu","existing_limit":2,"requested_limit":4}}}
+
+# 只声明其中一个字段、或上限不是正整数：请求校验直接拒绝
+curl -i -X POST http://localhost:8000/dags -H 'Content-Type: application/json' \
+  -d '{"tasks": [{"key": "x", "concurrency_group": "gpu"}]}'
+# -> 422
+```
+
+### 4. 续租（心跳）
 
 任务可能运行超过租约时长时，在到期前凭当前令牌续租：
 
@@ -135,7 +188,7 @@ curl -s -X POST http://localhost:8000/tasks/<TASK_ID>/heartbeat \
 租约过期并被他人重新领取后，再用旧令牌续租会得到 `409 lease_expired` /
 `409 invalid_lease`。
 
-### 4. 回报结果
+### 5. 回报结果
 
 回报必须携带客户端生成的幂等键 `completion_id`（建议用 UUID 等全局唯一值）：
 
@@ -166,7 +219,7 @@ curl -s -X POST http://localhost:8000/tasks/<TASK_ID>/complete \
 > 租约过期后旧令牌**首次**使用新 `completion_id` 的回报返回 **409**，
 > 不会作用于已开始的新尝试；只有曾成功生效过的幂等键才会回放首次响应。
 
-### 5. 状态查询
+### 6. 状态查询
 
 ```bash
 # DAG 概览（状态计数 + 任务列表，含阻塞原因）
@@ -184,6 +237,7 @@ curl -s 'http://localhost:8000/tasks?state=blocked'
 ```json
 {
   "key": "transform", "state": "failed", "attempt": 3, "max_retries": 2,
+  "concurrency_group": "gpu", "concurrency_limit": 2,
   "lease": null, "blocked_reason": null,
   "attempts": [
     {"attempt": 1, "state": "failed",    "error": "connection reset", "lease_token": "…", "expires_at": "…", "heartbeat_at": null, "expired": false},
@@ -193,10 +247,13 @@ curl -s 'http://localhost:8000/tasks?state=blocked'
 }
 ```
 
+所有任务视图（DAG 概览、任务详情、任务列表、领取响应）都携带
+`concurrency_group` 与 `concurrency_limit` 字段；未声明组的任务两者均为 `null`。
+
 被阻塞后继示例：`{"key": "load", "state": "blocked", "blocked_reason":
 "upstream 'transform' permanently failed", "lease": null}`。
 
-### 6. 事件流
+### 7. 事件流
 
 事件流只增不改，记录全部关键状态变迁。每条事件形如：
 
@@ -250,7 +307,7 @@ curl -s 'http://localhost:8000/events?after=0&limit=50'
 curl -s 'http://localhost:8000/events?dag_id=<DAG_ID>&after=0&limit=100'
 ```
 
-### 7. 只读分析（关键路径）
+### 8. 只读分析（关键路径）
 
 按任务声明的 `duration_seconds`（缺省 1）对整个 DAG 做关键路径分析，
 与任务当前运行状态无关，纯粹回答「如果现在开始，理想排程长什么样」：
@@ -303,10 +360,10 @@ curl -s http://localhost:8000/dags/<DAG_ID>/analysis | jq
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `POST` | `/dags` | 提交 DAG（校验缺失依赖与环） |
+| `POST` | `/dags` | 提交 DAG（校验缺失依赖、环与并发组上限一致性） |
 | `GET` | `/dags/{dag_id}` | DAG 概览：状态计数与任务列表 |
 | `GET` | `/dags/{dag_id}/analysis` | 只读分析：最早/最晚时间、总工期、关键路径与并行层级 |
-| `POST` | `/tasks/claim` | 原子领取前置全部成功的任务 |
+| `POST` | `/tasks/claim` | 原子领取前置全部成功的任务（按并发组限流，满组跳过） |
 | `GET` | `/tasks?dag_id=&state=` | 任务列表（可过滤） |
 | `GET` | `/events?after=&limit=&dag_id=` | 不可变事件流：按 sequence 升序键集分页 |
 | `GET` | `/tasks/{task_id}` | 任务详情：尝试历史、租约、阻塞原因 |
@@ -338,4 +395,7 @@ attempt 递增与令牌唯一、过期后旧令牌 409、心跳续租、重试�
 键集分页无漏项/重复、dag_id 过滤、参数校验、重启后不重置、存储层不可变）、
 只读分析（最早/最晚时间与总时差、总工期、关键路径与关键任务集合、并行层级、
 默认与小数时长、并列关键路径的确定性、只读不产生事件、404/422 错误路径、
-旧库迁移后默认时长）。
+旧库迁移后默认时长）、跨 DAG 并发组限流（成对与正整数校验、同提交/跨提交上限
+冲突整体回滚、跨 DAG 共享额度、满组跳过并尽量填满 limit、同批领取立即占位、
+完成/失败/过期自动释放名额、多线程领取不突破上限、任务视图返回组信息、
+旧库迁移后按无组处理）。

@@ -77,10 +77,21 @@ def init_db(path: Path | None = None) -> None:
                 -- 独立的显式失败计数：只有 complete(success=false) 才递增；
                 -- 租约过期后的重新领取只增加 attempt，不消耗重试预算。
                 failure_count       INTEGER NOT NULL DEFAULT 0,
+                -- 跨 DAG 并发组：两列同时为空（无组任务）或同时非空；
+                -- concurrency_limit 与 concurrency_groups 注册表中的上限保持一致。
+                concurrency_group   TEXT,
+                concurrency_limit   INTEGER,
                 created_at          TEXT NOT NULL,
                 started_at          TEXT,
                 finished_at         TEXT,
                 UNIQUE(dag_id, task_key)
+            );
+
+            -- 跨 DAG 并发组注册表：组名全局唯一，上限在首次声明时持久化；
+            -- 之后所有引用同名组的提交必须声明相同上限，否则整个提交回滚。
+            CREATE TABLE IF NOT EXISTS concurrency_groups (
+                name         TEXT PRIMARY KEY,
+                max_running  INTEGER NOT NULL CHECK (max_running > 0)
             );
 
             CREATE TABLE IF NOT EXISTS dependencies (
@@ -164,6 +175,11 @@ def init_db(path: Path | None = None) -> None:
             conn.execute(
                 "ALTER TABLE tasks ADD COLUMN duration_seconds REAL NOT NULL DEFAULT 1.0"
             )
+        # 旧库迁移：为已有任务补齐并发组列，默认 NULL（视为无组任务，行为不变）。
+        if "concurrency_group" not in columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN concurrency_group TEXT")
+        if "concurrency_limit" not in columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN concurrency_limit INTEGER")
 
 
 @contextmanager

@@ -1023,3 +1023,289 @@ def test_legacy_sqlite_db_gets_duration_default(tmp_path, monkeypatch):
     assert analysis["total_duration_seconds"] == 1 + 1  # 历史任务默认时长 1
     assert analysis["critical_path"] == ["a", "b"]
     assert analysis["levels"] == [["a"], ["b"]]
+
+
+# ------------------------------------------------------------- 跨 DAG 并发组限流
+
+def test_group_and_limit_must_be_provided_together(client):
+    r = client.post("/dags", json={"tasks": [{"key": "a", "concurrency_group": "gpu"}]})
+    assert r.status_code == 422
+    r = client.post("/dags", json={"tasks": [{"key": "a", "concurrency_limit": 2}]})
+    assert r.status_code == 422
+
+
+def test_group_limit_must_be_positive_integer(client):
+    for bad in (0, -1, 1.5):
+        r = client.post(
+            "/dags",
+            json={"tasks": [{"key": "a", "concurrency_group": "gpu",
+                             "concurrency_limit": bad}]},
+        )
+        assert r.status_code == 422
+
+
+def test_conflicting_limit_within_single_submit_rolls_back(client):
+    r = client.post(
+        "/dags",
+        json={
+            "id": "cg-self-conflict",
+            "tasks": [
+                {"key": "a", "concurrency_group": "gpu", "concurrency_limit": 2},
+                {"key": "b", "concurrency_group": "gpu", "concurrency_limit": 3},
+            ],
+        },
+    )
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "concurrency_limit_conflict"
+    # 校验发生在开事务之前：不留 DAG，也不留事件
+    assert client.get("/dags/cg-self-conflict").status_code == 404
+    assert client.get("/events", params={"dag_id": "cg-self-conflict"}).json()["events"] == []
+
+
+def test_conflicting_limit_with_persisted_group_rolls_back(client):
+    submit(client, [{"key": "a", "concurrency_group": "gpu", "concurrency_limit": 1}],
+           dag_id="cg-first")
+
+    r = client.post(
+        "/dags",
+        json={"id": "cg-second",
+              "tasks": [{"key": "x", "concurrency_group": "gpu", "concurrency_limit": 5}]},
+    )
+    assert r.status_code == 409
+    body = r.json()["error"]
+    assert body["code"] == "concurrency_limit_conflict"
+    assert body["details"]["group"] == "gpu"
+    assert body["details"]["existing_limit"] == 1
+    assert body["details"]["requested_limit"] == 5
+
+    # 冲突提交整体回滚：DAG 不存在、无事件，已持久化的组上限不被污染
+    assert client.get("/dags/cg-second").status_code == 404
+    assert client.get("/events", params={"dag_id": "cg-second"}).json()["events"] == []
+    dag = submit(client, [{"key": "x", "concurrency_group": "gpu", "concurrency_limit": 1}],
+                 dag_id="cg-second")
+    assert dag["task_count"] == 1
+
+
+def test_same_limit_group_shared_across_dags(client):
+    submit(client, [{"key": "a", "concurrency_group": "io", "concurrency_limit": 2}],
+           dag_id="cg-dag-1")
+    submit(client, [{"key": "b", "concurrency_group": "io", "concurrency_limit": 2}],
+           dag_id="cg-dag-2")
+    submit(client, [{"key": "c", "concurrency_group": "io", "concurrency_limit": 2}],
+           dag_id="cg-dag-3")
+
+    # 组上限跨 DAG 共享：三个 DAG 各有一个可领任务，全局最多同时运行 2 个
+    claimed = client.post("/tasks/claim", json={"limit": 10}).json()["claimed"]
+    assert len(claimed) == 2
+    assert {t["concurrency_group"] for t in claimed} == {"io"}
+    assert client.post("/tasks/claim", json={"limit": 10}).json()["count"] == 0
+
+    # 完成其中一个后名额释放，第三个 DAG 的任务可领
+    t = claimed[0]
+    assert client.post(f"/tasks/{t['task_id']}/complete",
+                       json={"completion_id": "cg-io-1", "lease_token": t["lease_token"],
+                             "success": True}).status_code == 200
+    claimed2 = client.post("/tasks/claim", json={"limit": 10}).json()["claimed"]
+    assert len(claimed2) == 1
+    # 新领到的是第三个 DAG 的任务（前两个 DAG 的任务一个已完成、一个仍在运行）
+    assert claimed2[0]["dag_id"] not in {t["dag_id"] for t in claimed}
+
+
+def test_full_group_is_skipped_and_limit_filled_with_others(client):
+    # 组 gpu 上限 2：3 个同组任务一次最多领 2 个；无组任务不受限，尽量填满 limit
+    submit(client, [
+        {"key": "g1", "concurrency_group": "gpu", "concurrency_limit": 2},
+        {"key": "g2", "concurrency_group": "gpu", "concurrency_limit": 2},
+        {"key": "g3", "concurrency_group": "gpu", "concurrency_limit": 2},
+        {"key": "p1"},
+        {"key": "p2"},
+    ])
+    claimed = client.post("/tasks/claim", json={"limit": 4}).json()["claimed"]
+    keys = [t["task_key"] for t in claimed]
+    assert len(keys) == 4  # 2 个组任务 + 2 个无组任务，正好填满 limit
+    assert sum(1 for k in keys if k.startswith("g")) == 2
+    assert sorted(k for k in keys if k.startswith("p")) == ["p1", "p2"]
+
+    # 组满且无其他可领任务：只剩 g3，被跳过
+    assert client.post("/tasks/claim", json={"limit": 10}).json()["count"] == 0
+
+
+def test_batch_claim_counts_new_claims_against_group_limit(client):
+    # 同一批次内新领取的任务立即占位：上限 2、4 个候选，一次批量领取不会突破
+    submit(client, [
+        {"key": k, "concurrency_group": "batch", "concurrency_limit": 2}
+        for k in ("a", "b", "c", "d")
+    ])
+    claimed = client.post("/tasks/claim", json={"limit": 10}).json()["claimed"]
+    assert len(claimed) == 2
+    assert all(t["concurrency_group"] == "batch" for t in claimed)
+    assert all(t["concurrency_limit"] == 2 for t in claimed)
+    assert client.post("/tasks/claim", json={"limit": 10}).json()["count"] == 0
+
+
+def test_group_slot_released_on_completion(client):
+    submit(client, [
+        {"key": "a", "concurrency_group": "rel", "concurrency_limit": 1},
+        {"key": "b", "concurrency_group": "rel", "concurrency_limit": 1},
+    ])
+    claimed = client.post("/tasks/claim", json={"limit": 10}).json()["claimed"]
+    assert len(claimed) == 1  # 上限 1：同批也只领一个
+    t = claimed[0]
+    client.post(f"/tasks/{t['task_id']}/complete",
+                json={"completion_id": "rel-1", "lease_token": t["lease_token"],
+                      "success": True})
+    # 完成后名额释放，同组另一个任务可领
+    claimed2 = client.post("/tasks/claim", json={"limit": 10}).json()["claimed"]
+    assert len(claimed2) == 1
+    assert claimed2[0]["task_id"] != t["task_id"]
+
+
+def test_group_slot_released_on_requeue_and_final_failure(client):
+    submit(client, [
+        {"key": "a", "concurrency_group": "relf", "concurrency_limit": 1, "max_retries": 1},
+        {"key": "b", "concurrency_group": "relf", "concurrency_limit": 1},
+    ])
+    t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    assert client.post("/tasks/claim", json={"limit": 10}).json()["count"] == 0
+
+    # 显式失败但仍有重试额度：回到 pending，名额随之释放（否则一个都领不到）
+    r = client.post(f"/tasks/{t['task_id']}/complete",
+                    json={"completion_id": "relf-1", "lease_token": t["lease_token"],
+                          "success": False, "error": "boom"})
+    assert r.json()["state"] == "pending"
+    claimed = client.post("/tasks/claim", json={"limit": 10}).json()["claimed"]
+    assert len(claimed) == 1
+
+    # 最终失败（重试耗尽）同样释放名额
+    t2 = claimed[0]
+    client.post(f"/tasks/{t2['task_id']}/complete",
+                json={"completion_id": "relf-2", "lease_token": t2["lease_token"],
+                      "success": False, "error": "fatal"})
+    claimed2 = client.post("/tasks/claim", json={"limit": 10}).json()["claimed"]
+    assert len(claimed2) == 1
+
+
+def test_group_slot_released_on_lease_expiry(client):
+    submit(client, [
+        {"key": "a", "concurrency_group": "rele", "concurrency_limit": 1,
+         "lease_seconds": 0.2},
+    ], dag_id="cg-exp-1")
+    t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    assert t["task_key"] == "a"
+    # 同组新 DAG 的任务在租约未过期时无法领取（组占用跨 DAG 统计）
+    submit(client, [{"key": "b", "concurrency_group": "rele", "concurrency_limit": 1}],
+           dag_id="cg-exp-2")
+    assert client.post("/tasks/claim", json={"limit": 10}).json()["count"] == 0
+    time.sleep(0.25)  # 租约过期：名额自动释放，无需任何回报
+    assert client.post("/tasks/claim", json={"limit": 10}).json()["count"] == 1
+
+
+def test_ungrouped_tasks_unaffected_by_group_limits(client):
+    # 无组任务不受任何组上限约束，行为与未声明组时一致
+    submit(client, [
+        {"key": "g", "concurrency_group": "iso", "concurrency_limit": 1},
+        {"key": "p1"},
+        {"key": "p2"},
+        {"key": "p3"},
+    ])
+    claimed = client.post("/tasks/claim", json={"limit": 10}).json()["claimed"]
+    assert len(claimed) == 4  # 组任务 1 个（上限）+ 全部 3 个无组任务
+    assert sum(1 for t in claimed if t["concurrency_group"] is None) == 3
+
+
+def test_concurrent_claims_never_exceed_group_limit(client):
+    submit(client, [
+        {"key": k, "concurrency_group": "race", "concurrency_limit": 2}
+        for k in ("a", "b", "c", "d")
+    ])
+    results = []
+    errors = []
+
+    def worker():
+        try:
+            r = client.post("/tasks/claim",
+                            json={"worker_id": f"w-{threading.get_ident()}", "limit": 4})
+            results.extend(r.json()["claimed"])
+        except Exception as e:  # pragma: no cover
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+
+    assert not errors
+    assert len(results) == 2  # 多线程批量领取也不会突破全局组上限
+    assert len({t["task_id"] for t in results}) == 2
+
+
+def test_concurrency_group_exposed_in_task_views(client):
+    dag = submit(client, [{"key": "a", "concurrency_group": "gpu", "concurrency_limit": 3}],
+                 dag_id="cg-view")
+    assert by_key(dag, "a")["concurrency_group"] == "gpu"
+    assert by_key(dag, "a")["concurrency_limit"] == 3
+
+    overview = client.get("/dags/cg-view").json()
+    assert by_key(overview, "a")["concurrency_group"] == "gpu"
+    assert by_key(overview, "a")["concurrency_limit"] == 3
+
+    task_id = overview["tasks"][0]["id"]
+    detail = client.get(f"/tasks/{task_id}").json()
+    assert detail["concurrency_group"] == "gpu"
+    assert detail["concurrency_limit"] == 3
+
+    listed = client.get("/tasks", params={"dag_id": "cg-view"}).json()["tasks"]
+    assert listed[0]["concurrency_group"] == "gpu"
+    assert listed[0]["concurrency_limit"] == 3
+
+    # 领取响应同样携带组信息
+    claimed = client.post("/tasks/claim", json={"dag_id": "cg-view"}).json()["claimed"][0]
+    assert claimed["concurrency_group"] == "gpu"
+    assert claimed["concurrency_limit"] == 3
+
+    # 无组任务两个字段均为 null
+    dag2 = submit(client, [{"key": "plain"}], dag_id="cg-view-2")
+    assert by_key(dag2, "plain")["concurrency_group"] is None
+    assert by_key(dag2, "plain")["concurrency_limit"] is None
+
+
+def test_legacy_sqlite_db_gets_concurrency_columns(tmp_path, monkeypatch):
+    """旧版 tasks 表（无并发组列）迁移后两列为 NULL，任务按无组处理。"""
+    import sqlite3
+
+    db_file = tmp_path / "legacy-cg.db"
+    conn = sqlite3.connect(db_file)
+    conn.executescript(
+        """
+        CREATE TABLE dags (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY, dag_id TEXT NOT NULL, task_key TEXT NOT NULL, name TEXT NOT NULL,
+            payload TEXT, max_retries INTEGER NOT NULL DEFAULT 0, lease_seconds REAL NOT NULL,
+            state TEXT NOT NULL, blocked_reason TEXT, lease_token TEXT, lease_expires_at TEXT,
+            worker_id TEXT, attempt INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+            UNIQUE(dag_id, task_key));
+        CREATE TABLE dependencies (dag_id TEXT, task_key TEXT, dep_key,
+            PRIMARY KEY (dag_id, task_key, dep_key));
+        INSERT INTO dags VALUES ('d1', 'old', '2026-01-01T00:00:00Z');
+        INSERT INTO tasks (id, dag_id, task_key, name, max_retries, lease_seconds, state,
+                           attempt, created_at)
+        VALUES ('t1', 'd1', 'a', 'a', 0, 30, 'pending', 0, '2026-01-01T00:00:00Z');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setenv("DB_PATH", str(db_file))
+    from app.db import init_db
+    from app import service
+
+    init_db()
+    init_db()  # 迁移幂等
+
+    task = service.get_task("t1")
+    assert task["concurrency_group"] is None
+    assert task["concurrency_limit"] is None
+    # 无组任务照常可领
+    assert service.claim_tasks(None, None, 1)["count"] == 1

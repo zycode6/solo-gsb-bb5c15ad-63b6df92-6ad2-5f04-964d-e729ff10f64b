@@ -168,6 +168,28 @@ def submit_dag(body: dict[str, Any]) -> dict[str, Any]:
     if cycle:
         raise APIError(422, "cycle_detected", "依赖图存在环，必须是 DAG", {"cycle": cycle})
 
+    # 并发组声明（concurrency_group/limit 成对出现由 schema 保证）：
+    # 同一提交内同名组的上限必须一致
+    group_limits: dict[str, int] = {}
+    for key in keys:
+        t = tasks_by_key[key]
+        group = t.get("concurrency_group")
+        if group is None:
+            continue
+        limit = t["concurrency_limit"]
+        if group in group_limits and group_limits[group] != limit:
+            raise APIError(
+                422,
+                "concurrency_limit_conflict",
+                f"并发组 '{group}' 在同一提交中声明了不同的上限",
+                {
+                    "group": group,
+                    "existing_limit": group_limits[group],
+                    "requested_limit": limit,
+                },
+            )
+        group_limits[group] = limit
+
     default_lease = get_default_lease_seconds()
     default_duration = get_default_duration_seconds()
     now = _iso(_now())
@@ -187,14 +209,39 @@ def submit_dag(body: dict[str, Any]) -> dict[str, Any]:
             # dag.created 与 DAG/任务行同事务：创建失败（回滚）不留事件；
             # 可空字段 task_id/attempt/from_state/to_state 一律为 NULL
             _append_event(conn, EVT_DAG_CREATED, dag_id, now)
+            # 同名并发组的上限必须与已持久化的一致；冲突抛错后整个提交
+            # （dag 行、任务行、事件）在同一事务内整体回滚
+            for group, limit in group_limits.items():
+                existing = conn.execute(
+                    "SELECT max_running FROM concurrency_groups WHERE name = ?", (group,)
+                ).fetchone()
+                if existing is None:
+                    conn.execute(
+                        "INSERT INTO concurrency_groups (name, max_running) VALUES (?, ?)",
+                        (group, limit),
+                    )
+                elif existing["max_running"] != limit:
+                    raise APIError(
+                        409,
+                        "concurrency_limit_conflict",
+                        f"并发组 '{group}' 已存在，持久化上限 {existing['max_running']} "
+                        f"与本次声明的 {limit} 不一致",
+                        {
+                            "group": group,
+                            "existing_limit": existing["max_running"],
+                            "requested_limit": limit,
+                        },
+                    )
             for key in keys:
                 t = tasks_by_key[key]
                 lease = float(t.get("lease_seconds") or default_lease)
                 duration = float(t.get("duration_seconds") or default_duration)
                 conn.execute(
                     """INSERT INTO tasks (id, dag_id, task_key, name, payload,
-                           max_retries, lease_seconds, duration_seconds, state, attempt, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)""",
+                           max_retries, lease_seconds, duration_seconds,
+                           concurrency_group, concurrency_limit,
+                           state, attempt, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)""",
                     (
                         uuid.uuid4().hex,
                         dag_id,
@@ -204,6 +251,8 @@ def submit_dag(body: dict[str, Any]) -> dict[str, Any]:
                         int(t.get("max_retries") or 0),
                         lease,
                         duration,
+                        t.get("concurrency_group"),
+                        t.get("concurrency_limit"),
                         PENDING,
                         now,
                     ),
@@ -223,6 +272,8 @@ def submit_dag(body: dict[str, Any]) -> dict[str, Any]:
 
 # ---------------------------------------------------------------- 原子领取
 
+# 不加 SQL LIMIT：并发组已满的候选会被跳过，必须继续扫描后续任务以尽量填满
+# 本次领取上限；实际领取数量在事务内按组占用逐个判定（见 claim_tasks）。
 _CLAIMABLE_SQL = """
     SELECT t.*
     FROM tasks t
@@ -243,7 +294,19 @@ _CLAIMABLE_SQL = """
               AND p.state <> 'succeeded'
           )
     ORDER BY t.created_at, t.id
-    LIMIT :limit
+"""
+
+# 跨 DAG 并发组占用：全局未过期 running 租约的数量。与可领取判定中的过期
+# 条件（lease_expires_at < now）严格互补——租约一到期，任务既可被重新领取，
+# 同时也不再占用组名额（完成/失败/阻塞时租约被清除，同样立即释放）。
+_GROUP_USAGE_SQL = """
+    SELECT concurrency_group AS grp, COUNT(*) AS n
+    FROM tasks
+    WHERE concurrency_group IS NOT NULL
+      AND state = 'running'
+      AND lease_expires_at IS NOT NULL
+      AND lease_expires_at >= :now
+    GROUP BY concurrency_group
 """
 
 
@@ -261,10 +324,31 @@ def claim_tasks(worker_id: str | None, dag_id: str | None, limit: int) -> dict[s
         try:
             rows = conn.execute(
                 _CLAIMABLE_SQL,
-                {"dag_id": dag_id, "now": _iso(now), "limit": limit},
+                {"dag_id": dag_id, "now": _iso(now)},
             ).fetchall()
 
+            # 并发组占用与上限都在本事务内读取：BEGIN IMMEDIATE 的保留锁保证
+            # 统计与后续领取之间没有其他写事务插入。上限以注册表为准
+            # （提交时已保证同名组一致），任务行上的 limit 仅作兜底。
+            usage: dict[str, int] = {
+                r["grp"]: r["n"]
+                for r in conn.execute(_GROUP_USAGE_SQL, {"now": _iso(now)}).fetchall()
+            }
+            caps: dict[str, int] = {
+                r["name"]: r["max_running"]
+                for r in conn.execute(
+                    "SELECT name, max_running FROM concurrency_groups"
+                ).fetchall()
+            }
+
             for row in rows:
+                if len(claimed) >= limit:
+                    break
+                group = row["concurrency_group"]
+                if group is not None and usage.get(group, 0) >= caps.get(
+                    group, row["concurrency_limit"]
+                ):
+                    continue  # 组已满：跳过该任务，继续寻找其他可领取任务
                 attempt_no = row["attempt"] + 1
                 token = uuid.uuid4().hex
                 expires = now + timedelta(seconds=row["lease_seconds"])
@@ -311,8 +395,13 @@ def claim_tasks(worker_id: str | None, dag_id: str | None, limit: int) -> dict[s
                         "lease_token": token,
                         "lease_expires_at": _iso(expires),
                         "lease_seconds": row["lease_seconds"],
+                        "concurrency_group": group,
+                        "concurrency_limit": row["concurrency_limit"],
                     }
                 )
+                if group is not None:
+                    # 本批次新领取立即占位：后续同组候选看到更新后的占用
+                    usage[group] = usage.get(group, 0) + 1
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
@@ -663,6 +752,8 @@ def _task_dict(conn, row, with_attempts: bool = True) -> dict[str, Any]:
         "duration_seconds": row["duration_seconds"],
         # 剩余重试额度只与显式失败计数挂钩，与 attempt（含租约过期重领）无关
         "retries_remaining": max(0, row["max_retries"] - row["failure_count"]),
+        "concurrency_group": row["concurrency_group"],
+        "concurrency_limit": row["concurrency_limit"],
         "lease": lease,
         "blocked_reason": row["blocked_reason"],
         "created_at": row["created_at"],

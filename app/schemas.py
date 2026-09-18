@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class TaskIn(BaseModel):
@@ -17,6 +17,18 @@ class TaskIn(BaseModel):
     duration_seconds: float | None = Field(
         None, gt=0, allow_inf_nan=False, description="预计执行时长（秒），缺省为 1；用于只读分析"
     )
+    concurrency_group: str | None = Field(
+        None, min_length=1, description="跨 DAG 并发组名；须与 concurrency_limit 同时提供"
+    )
+    concurrency_limit: int | None = Field(
+        None, gt=0, description="同名组全局最多同时运行的未过期租约数；正整数"
+    )
+
+    @model_validator(mode="after")
+    def _group_and_limit_paired(self) -> "TaskIn":
+        if (self.concurrency_group is None) != (self.concurrency_limit is None):
+            raise ValueError("concurrency_group 与 concurrency_limit 必须同时提供")
+        return self
 
 
 class DAGSubmitIn(BaseModel):
